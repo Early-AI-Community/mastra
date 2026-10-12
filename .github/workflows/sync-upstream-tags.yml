@@ -1,0 +1,33 @@
+name: Sync upstream tags
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-tags
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Only run in our fork; never in mastra-ai/mastra.
+    if: ${{ github.repository == 'Early-AI-Community/mastra' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@e8d4307400f9427dba7cb98e488d6ab85f1cec5f
+        with:
+          # Full clone; a partial clone can fail to push tag objects.
+          fetch-depth: 0
+
+      - name: Fetch upstream tags and push to fork
+        run: |
+          git remote add upstream https://github.com/mastra-ai/mastra.git
+          git remote set-url --push upstream DISABLED
+          git fetch upstream --tags --no-recurse-submodules
+          # Batches of 1,000: GitHub rejects pushes with too many refs.
+          # Existing tags are a no-op; never force.
+          git tag | xargs -n 1000 sh -c 'git push origin $(printf "refs/tags/%s " "$@")' _
