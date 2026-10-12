@@ -27,7 +27,8 @@ jobs:
         run: |
           git remote add upstream https://github.com/mastra-ai/mastra.git
           git remote set-url --push upstream DISABLED
-          git fetch upstream --tags --no-recurse-submodules
+          # Fetch tags only; skip upstream's thousands of branches.
+          git fetch upstream 'refs/tags/*:refs/tags/*' --no-recurse-submodules
           # Batches of 1,000: GitHub rejects pushes with too many refs.
           # Existing tags are a no-op; never force.
           git tag | xargs -n 1000 sh -c 'git push origin $(printf "refs/tags/%s " "$@")' _
