@@ -124,6 +124,10 @@ describe('createTraceFilterBarFields', () => {
     expect(byId('serviceName')).toBeUndefined();
   });
 
+  it('labels the span model field as Span Model', () => {
+    expect(byId('spans.model')?.label).toBe('Span Model');
+  });
+
   describe('when the server supports root duration predicates', () => {
     const rootDuration = createTraceFilterBarFields({
       availableRootEntityNames: [],
@@ -371,10 +375,10 @@ describe('createTraceFilterBarFields', () => {
       'resourceId',
       'threadId',
       'traceId',
-      'spans.model',
       'spans.provider',
       'spans.durationMs',
       'spans.error',
+      'spans.model',
       'spans.name',
       'spans.spanType',
       'scores.score',
@@ -492,6 +496,37 @@ describe('metadata filter URL params', () => {
   it('counts a filterMetadata.<key> param as an existing filter so hydration does not re-append it', () => {
     expect(hasAnyTraceFilterParams(new URLSearchParams('filterMetadata.region=eu-west'))).toBe(true);
     expect(hasAnyTraceFilterParams(new URLSearchParams('page=2'))).toBe(false);
+  });
+});
+
+describe('synthetic filter URL params', () => {
+  describe('when status or primitive type is "is any of"', () => {
+    const tokens = [
+      { fieldId: 'rootEntityType', operatorId: 'in' as const, value: ['agent', 'workflow_run'] },
+      { fieldId: 'status', operatorId: 'in' as const, value: ['success', 'error'] },
+    ];
+
+    it('keeps every value through a URL round trip', () => {
+      const params = new URLSearchParams();
+      applyTracePropertyFilterTokens(params, tokens);
+
+      expect(getTracePropertyFilterTokens(params)).toEqual(tokens);
+    });
+
+    it('keeps every value when persisted for storage', () => {
+      const params = new URLSearchParams();
+      applyTracePropertyFilterTokens(params, tokens);
+
+      expect(getTracePropertyFilterTokens(getPreservedTraceFilterParams(params))).toEqual(tokens);
+    });
+  });
+
+  it('drops a stale operator when status goes back to a single value', () => {
+    const params = new URLSearchParams('status=success&status=error&status.op=in');
+
+    applyTracePropertyFilterTokens(params, [{ fieldId: 'status', value: 'error' }]);
+
+    expect(params.toString()).toBe('status=error');
   });
 });
 

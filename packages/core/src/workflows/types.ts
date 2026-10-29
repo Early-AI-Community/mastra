@@ -56,6 +56,7 @@ export type RestartExecutionParams = {
   stepExecutionPath?: string[];
   isPreFirstStepRestart?: boolean;
   isParallelOrConditionalRestarted?: boolean;
+  isForeachRestarted?: boolean;
 };
 
 export type TimeTravelExecutionParams = {
@@ -418,6 +419,21 @@ export interface WorkflowRunState {
   resumeLabels: Record<string, WorkflowResumeLabel>;
   waitingPaths: Record<string, number[]>;
   timestamp: number;
+  /**
+   * Epoch ms when an agent resume claimed this suspended run (status `pending`). Lets a later
+   * resume recognize a claim abandoned by a process that died before starting the run.
+   * @internal
+   */
+  resumeClaimedAt?: number;
+  /**
+   * The `resumeClaimedAt` of an agent resume that started running while holding a run-ownership
+   * lease on its claim. Only such a `running` claim can be taken over once its lease lapses, so a
+   * resume started by a process that holds no lease is never taken over.
+   * @internal
+   */
+  resumeLeasedClaimAt?: number;
+  /** @internal Snapshot created only to guard evented step deliveries. */
+  guardedOnlySnapshot?: boolean;
   /** Tripwire data when status is 'tripwire' */
   tripwire?: StepTripwireInfo;
   stepExecutionPath?: string[];
@@ -567,6 +583,14 @@ export interface WorkflowOptions {
    * for reduced snapshot writes and serialize their own resumes.
    */
   allowUnclaimedResumes?: boolean;
+
+  /**
+   * Writes the resume claim (`suspended -> running`) even when `shouldPersistSnapshot`
+   * excludes `running`, so a resumed run stops reading back as `suspended` while it runs.
+   *
+   * @internal Set by durable agent loops, whose suspended-run listing reads the stored status.
+   */
+  persistResumeClaim?: boolean;
 
   /**
    * Identifies step errors raised because this execution lost, or could not
@@ -1025,7 +1049,7 @@ export type StepParams<
     TResumeSchema extends PublicSchema<any> ? InferPublicSchema<TResumeSchema> : unknown,
     TSuspendSchema extends PublicSchema<any> ? InferPublicSchema<TSuspendSchema> : unknown,
     DefaultEngineType,
-    TRequestContextSchema extends PublicSchema<any> ? InferPublicSchema<TRequestContextSchema> : unknown
+    InferWorkflowRequestContext<TRequestContextSchema>
   >;
 };
 
@@ -1257,6 +1281,26 @@ export type WorkflowConfig<
 export type InferSchemaOutput<T> = T extends PublicSchema<any> ? InferPublicSchema<T> : unknown;
 
 /**
+ * Infers the request context type for workflows and steps.
+ *
+ * Workflows validate request context without decoding it, so step code sees the raw input values.
+ * Unlike `InferPublicSchema`, this does not resolve a Standard Schema's optional `~standard.types`
+ * to its transformed output, which would type raw values as decoded ones.
+ */
+export type InferWorkflowRequestContext<T> =
+  T extends PublicSchema<any>
+    ? T extends { _output: infer Output }
+      ? Output
+      : T extends { _type: infer Output }
+        ? Output
+        : T extends { '~standard': { types: { output: infer Output } } }
+          ? Output
+          : T extends PublicSchema<infer Output>
+            ? Output
+            : never
+    : unknown;
+
+/**
  * Schema-typed variant of `WorkflowConfig` used by `createWorkflow` factories.
  *
  * Instead of inferring output types through the `PublicSchema<TOutput>` union
@@ -1290,7 +1334,7 @@ export type CreateWorkflowParams<
   schedule?: WorkflowScheduleInput<
     NoInfer<InferSchemaOutput<TInputSchema>>,
     NoInfer<InferSchemaOutput<TStateSchema>>,
-    NoInfer<InferSchemaOutput<TRequestContextSchema>>
+    NoInfer<InferWorkflowRequestContext<TRequestContextSchema>>
   >;
 };
 

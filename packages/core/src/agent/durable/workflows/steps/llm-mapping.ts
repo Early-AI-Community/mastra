@@ -1,3 +1,4 @@
+import { compactDurableStepContent } from '@internal/core/durable';
 import { z } from 'zod';
 import { MastraFGAPermissions } from '../../../../auth/ee';
 import {
@@ -5,8 +6,8 @@ import {
   computeModelOutputProviderMetadata,
 } from '../../../../loop/shared/steps/tool-result-commit-core';
 import type { Mastra } from '../../../../mastra';
-import { SpanType } from '../../../../observability';
-import type { ExportedSpan } from '../../../../observability';
+import type { SpanType, ExportedSpan } from '../../../../observability';
+import { extractUsageMetrics } from '../../../../observability/usage';
 import { persistProcessorDataChunk } from '../../../../stream/base/output';
 import { withToolPayloadTransformProviderMetadata } from '../../../../tools/payload-transform';
 import { createStep } from '../../../../workflows/workflow';
@@ -14,7 +15,7 @@ import { MessageList } from '../../../message-list';
 import { DurableStepIds } from '../../constants';
 import { assertExecutionOwned, isExecutionFenceError } from '../../execution-fence';
 import { authorizeDurableMemory, getDurableMemoryAuthorizationChecks } from '../../memory-fga';
-import { globalRunRegistry } from '../../run-registry';
+import { getRunRegistryEntry } from '../../run-registry';
 import type {
   DurableLLMStepOutput,
   DurableToolCallOutput,
@@ -52,12 +53,16 @@ const durableLLMMappingOutputSchema = z.object({
     toolCalls: z.array(z.any()).optional(),
     usage: z.any(),
     steps: z.array(z.any()),
+    content: z.array(z.any()).optional(),
   }),
   state: z.any(),
   delegationBailed: z.boolean().optional(),
   processorRetryCount: z.number().optional(),
   processorRetryFeedback: z.string().optional(),
+  releasedToolResultIds: z.array(z.string()).optional(),
   deferredStepFinishChunk: z.any().optional(),
+  completionStartTime: z.coerce.date().optional(),
+  timeToFirstTokenMs: z.number().optional(),
 });
 
 /**
@@ -100,7 +105,7 @@ export function createDurableLLMMappingStep() {
       // consumers holding a reference to it — e.g. the stream adapter's
       // MastraModelOutput, which reads it for scoringData — keep seeing state
       // updates. A fresh instance here would orphan those references.
-      const registryEntry = globalRunRegistry.get(_runId);
+      const registryEntry = getRunRegistryEntry(_runId, mastra as Mastra | undefined);
       const messageList = (
         registryEntry?.messageList ??
         new MessageList({
@@ -181,11 +186,9 @@ export function createDurableLLMMappingStep() {
             throw mappingError;
           }
 
-          // An aborted call was cancelled mid-flight, not completed: recording it
-          // would fake-complete the call (`result: undefined` reads as success on
-          // resume), so leave the invocation incomplete. Mirrors the non-durable
-          // llm-mapping-step's aborted exclusion.
-          if (toolResult.aborted) {
+          // Only executed calls carry a cancellation notice. An aborted call with
+          // no result must not be recorded as a fabricated successful output.
+          if (toolResult.aborted && toolResult.result === undefined) {
             continue;
           }
 
@@ -244,6 +247,7 @@ export function createDurableLLMMappingStep() {
             | undefined;
           if (
             !toolResult.error &&
+            !toolResult.aborted &&
             toolResult.result != null &&
             !toolResult.providerExecuted &&
             !toolResult.modelOutputComputed
@@ -390,6 +394,15 @@ export function createDurableLLMMappingStep() {
             totalTokens: undefined,
           },
           steps: [], // Steps are accumulated at the loop level
+          // Recorded on the step record; stopWhen reads it, and the deferred
+          // step-finish chunk returns it as stream.steps content.
+          content: compactDurableStepContent(
+            messageList.get.response.aiV5.modelContent(
+              -1,
+              llmOutput.toolCalls.map(call => call.toolCallId),
+            ),
+            toolResults,
+          ),
         },
         state: {
           ...state,
@@ -397,8 +410,11 @@ export function createDurableLLMMappingStep() {
         },
         processorRetryCount: llmOutput.processorRetryCount,
         processorRetryFeedback: llmOutput.processorRetryFeedback,
+        releasedToolResultIds: llmOutput.releasedToolResultIds,
         delegationBailed,
         deferredStepFinishChunk,
+        completionStartTime: llmOutput.completionStartTime,
+        timeToFirstTokenMs: llmOutput.timeToFirstTokenMs,
       };
 
       // Close the MODEL_STEP span for tool-calling iterations: the LLM step defers it so
@@ -413,7 +429,7 @@ export function createDurableLLMMappingStep() {
               toolCalls: llmOutput.toolCalls,
             },
             attributes: {
-              usage: pendingPayload?.output?.usage,
+              usage: extractUsageMetrics(pendingPayload?.output?.usage, pendingPayload?.metadata?.providerMetadata),
               finishReason: pendingPayload?.stepResult?.reason,
               isContinued: pendingPayload?.stepResult?.isContinued,
             },
@@ -435,7 +451,7 @@ export function createDurableLLMMappingStep() {
         state.threadId &&
         state.resourceId
       ) {
-        const authorizationEntry = globalRunRegistry.get(_runId);
+        const authorizationEntry = getRunRegistryEntry(_runId, mastra as Mastra | undefined);
         const authorizationRequestContext = authorizationEntry?.requestContext ?? requestContext;
         const authorizeMemory = (permission: Parameters<typeof authorizeDurableMemory>[1]['permission']) =>
           authorizeDurableMemory(getDurableMemoryAuthorizationChecks(authorizationEntry), {
@@ -453,8 +469,8 @@ export function createDurableLLMMappingStep() {
         try {
           // Re-read the entry: tool-call may have rebuilt the save queue into it. A connect()
           // worker in another process has none until something rebuilds it.
-          let saveQueueManager = globalRunRegistry.get(_runId)?.saveQueueManager;
-          let memory = globalRunRegistry.get(_runId)?.memory;
+          let saveQueueManager = getRunRegistryEntry(_runId, mastra as Mastra | undefined)?.saveQueueManager;
+          let memory = getRunRegistryEntry(_runId, mastra as Mastra | undefined)?.memory;
           if (!saveQueueManager && mastra) {
             const rebuilt = await rebuildRunToolsFromMastra({
               mastra: mastra as Mastra,

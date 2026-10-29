@@ -13,14 +13,17 @@ import type {
   OutputProcessorOrWorkflow,
 } from '../../../processors';
 import { MASTRA_AUTH_TOKEN_KEY, RequestContext } from '../../../request-context';
-import { getNeedsApprovalFn } from '../../../tools/toolchecks';
+import { getNeedsApprovalFn, isApprovalExempt } from '../../../tools/toolchecks';
 import type { CoreTool, RequireToolApproval, ToolApprovalContext } from '../../../tools/types';
 import type { Workspace } from '../../../workspace';
+import type { Agent } from '../../agent';
 import type { MessageList } from '../../message-list';
 import { SaveQueueManager } from '../../save-queue';
+import { restoreRunAgentScopes } from '../../scopes';
 import type { ToolsInput } from '../../types';
+import { isDurableAgentLike } from '../../types';
 import { recordRunSavedMessages } from '../run-message-refs';
-import { globalRunRegistry } from '../run-registry';
+import { getRunRegistryEntry, globalRunRegistry, setRunRegistryEntry } from '../run-registry';
 import type {
   RunRegistryEntry,
   SerializableDurableState,
@@ -128,6 +131,7 @@ export function restoreRequestContext(entries?: Record<string, unknown>, runLeve
     if (liveToken !== undefined) {
       restored.setRaw(MASTRA_AUTH_TOKEN_KEY, liveToken);
     }
+    restoreRunAgentScopes(restored);
     return restored;
   }
   return runLevel ?? new RequestContext();
@@ -232,7 +236,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   // see the updated state.  Creating a new instance each iteration would
   // orphan those references (their newResponseMessages Set would point at
   // stale objects).
-  const existingEntry = globalRunRegistry.get(runId);
+  const existingEntry = getRunRegistryEntry(runId, mastra as Mastra | undefined);
   const messageList = existingEntry?.messageList
     ? existingEntry.messageList.deserialize(input.messageListState)
     : createRunMessageList({
@@ -259,7 +263,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   // are detected by the explicit `isPlaceholder` flag or by the absence of a
   // real model instance (every in-process seeding site stores the live model;
   // placeholders and metadata-only stubs do not).
-  const globalEntry = globalRunRegistry.get(runId);
+  const globalEntry = getRunRegistryEntry(runId, mastra as Mastra | undefined);
   const hasHydratedEntry = isHydratedRegistryEntry(globalEntry);
   // Prefer the full toolset over `tools`: after the first step `tools` holds the
   // per-step snapshot the model was shown (possibly narrowed by processors such
@@ -276,6 +280,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   let errorProcessors: ErrorProcessorOrWorkflow[] | undefined = globalEntry?.errorProcessors;
   let processorStates: Map<string, ProcessorState> | undefined = globalEntry?.processorStates;
   let rehydratedFromMastra = false;
+  let rebuiltAgent: Agent<any, any, any, any> | undefined;
 
   // If the registry entry is a real (non-placeholder) in-process entry we
   // trust it wholesale (in-process / same-process resume). Otherwise fall
@@ -285,6 +290,7 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
   } else if (mastra) {
     try {
       const agent = mastra.getAgentById(agentId);
+      rebuiltAgent = isDurableAgentLike(agent) && agent.agent !== agent ? agent.agent : agent;
 
       // Restore the caller's request context from the JSON-safe snapshot on
       // the workflow input (mirrors durable-agent.ts resume handling), so
@@ -381,11 +387,12 @@ export async function resolveRuntimeDependencies(options: ResolveRuntimeOptions)
       outputProcessors,
       errorProcessors,
       processorStates,
+      agent: rebuiltAgent,
     };
     if (globalEntry) {
       Object.assign(globalEntry, rebuilt);
     } else {
-      globalRunRegistry.set(runId, rebuilt as RunRegistryEntry);
+      setRunRegistryEntry(runId, rebuilt as RunRegistryEntry, mastra as Mastra | undefined);
     }
   }
 
@@ -444,7 +451,7 @@ export interface RebuiltRunTools {
  * The durable tool-call step runs as a SEPARATE step from the LLM-execution
  * step and, on a cross-process engine (e.g. the @mastra/inngest connect()
  * worker), can execute in a different process than the one that prepared the
- * run. In that process `globalRunRegistry.get(runId)` is empty (or a minimal
+ * run. In that process `getRunRegistryEntry(runId, mastra as Mastra | undefined)` is empty (or a minimal
  * placeholder), so per-request closure tools (workspace/skill tools:
  * `skill`, `skill_read`, `skill_search`, `mastra_workspace_*`) are absent and
  * the model's tool call rejects with `ToolNotFoundError`.
@@ -491,6 +498,7 @@ export async function rebuildRunToolsFromMastra(options: {
   try {
     const agent = mastra.getAgentById(agentId);
     agentResolved = true;
+    const processorAgent = isDurableAgentLike(agent) && agent.agent !== agent ? agent.agent : agent;
     // Restore the caller's request context so request-scoped tools, workspace
     // and memory resolve with the same configuration as the original call.
     const resolveRequestContext = restoreRequestContext(requestContextEntries, requestContext);
@@ -507,13 +515,13 @@ export async function rebuildRunToolsFromMastra(options: {
 
     // A hydrated entry means the caller's process still holds the toolset tools
     // (e.g. a memoryless run rebuilding only for a save queue), so nothing was lost.
-    const toolsetsLocal = isHydratedRegistryEntry(globalRunRegistry.get(runId));
+    const toolsetsLocal = isHydratedRegistryEntry(getRunRegistryEntry(runId, mastra as Mastra | undefined));
     if (!toolsetsLocal) assertToolsetToolsAvailable(tools, execOptions?.toolsetToolNames, agentId, runId);
 
     const memory = await (agent as any).getMemory?.({ requestContext: resolveRequestContext });
     const workspace = await (agent as any).getWorkspace?.({ requestContext: resolveRequestContext });
     const saveQueueManager = makeSaveQueueManager(memory, runId, mastra);
-    let existing = globalRunRegistry.get(runId);
+    let existing = getRunRegistryEntry(runId, mastra as Mastra | undefined);
     const rebuiltProcessors: Partial<Awaited<ReturnType<typeof rebuildProcessorPipeline>>> =
       !options.rehydrateProcessors
         ? {}
@@ -542,11 +550,12 @@ export async function rebuildRunToolsFromMastra(options: {
       workspace,
       memory,
       saveQueueManager,
+      agent: processorAgent,
       ...rebuiltProcessors,
       ...(options.rehydrateProcessors ? { requestContext: resolveRequestContext } : {}),
     };
     // A sibling may have published during construction. Keep lookup, merge and return synchronous.
-    existing = globalRunRegistry.get(runId);
+    existing = getRunRegistryEntry(runId, mastra as Mastra | undefined);
     if (existing) {
       const needsProcessorPipeline = !existing.outputProcessors || !existing.processorStates;
       if (
@@ -570,9 +579,10 @@ export async function rebuildRunToolsFromMastra(options: {
       existing.outputProcessors ??= rebuiltProcessors.outputProcessors;
       existing.errorProcessors ??= rebuiltProcessors.errorProcessors;
       existing.processorStates ??= rebuiltProcessors.processorStates;
+      existing.agent ??= processorAgent;
     } else {
       existing = patch as RunRegistryEntry;
-      globalRunRegistry.set(runId, existing);
+      setRunRegistryEntry(runId, existing, mastra as Mastra | undefined);
     }
 
     return {
@@ -590,7 +600,7 @@ export async function rebuildRunToolsFromMastra(options: {
   } catch (error) {
     if (error instanceof DurableProcessorRebuildError) throw error;
 
-    const entry = globalRunRegistry.get(runId);
+    const entry = getRunRegistryEntry(runId, mastra as Mastra | undefined);
     // Falling back would silently drop call-time toolsets, so surface the failure.
     if ((execOptions?.toolsetToolNames?.length ?? 0) > 0 && !isHydratedRegistryEntry(entry)) {
       throw error;
@@ -685,7 +695,8 @@ export function resolveTool(toolName: string, mastra?: Mastra): CoreTool | undef
  *  - Function-form global `requireToolApproval` is evaluated per call with
  *    `(toolName, args, ...)`. Throwing defaults to "require approval" (safe).
  *  - Boolean global / tool-level `requireApproval` seed the decision.
- *  - A per-tool `needsApprovalFn` (e.g. skill tools) is authoritative when
+ *  - Approval-exempt tools (skill tools) never require approval.
+ *  - A per-tool `needsApprovalFn` is authoritative when
  *    present and overrides the seed. It receives `{ requestContext, workspace }`
  *    as its second argument, exactly like the non-durable loop.
  *
@@ -698,6 +709,8 @@ export async function toolRequiresApproval(
   args?: Record<string, unknown>,
   approvalContext?: Partial<ToolApprovalContext> & { toolName: string },
 ): Promise<boolean> {
+  if (isApprovalExempt(tool)) return false;
+
   let globalRequires: boolean;
   if (typeof globalRequireApproval === 'function') {
     try {
@@ -717,7 +730,7 @@ export async function toolRequiresApproval(
 
   let requires = globalRequires || !!(tool as any).requireApproval;
 
-  // needsApprovalFn overrides all other flags (e.g., skill tools return false)
+  // needsApprovalFn overrides all other flags
   const needsApprovalFn = getNeedsApprovalFn(tool);
   if (needsApprovalFn) {
     try {

@@ -12,7 +12,6 @@ import {
 } from '@mastra/playground-ui/components/Dialog';
 import { Input } from '@mastra/playground-ui/components/Input';
 import { toast } from '@mastra/playground-ui/components/Toaster';
-import { Txt } from '@mastra/playground-ui/components/Txt';
 import { useState } from 'react';
 import type { ReactNode } from 'react';
 
@@ -23,7 +22,7 @@ import {
 import { PLATFORM_CONNECT_PROVIDERS } from '../../factory/services/platformConnect';
 import type { PlatformConnectProviderId, PlatformProviderConnection } from '../../factory/services/platformConnect';
 
-function connectionName(connection: PlatformProviderConnection): string {
+export function connectionName(connection: PlatformProviderConnection): string {
   return connection.displayName?.trim() || connection.accountLabel?.trim() || 'Connected account';
 }
 
@@ -70,27 +69,21 @@ function ApiKeyDialog({ provider, title, pending, onSubmit, onClose }: ApiKeyDia
 
 export interface ProviderConnectControlProps {
   provider: PlatformConnectProviderId;
-  /** Reconnect an existing connection instead of creating a new one. */
   reconnectConnectionId?: string;
   label: string;
+  buttonLabel?: string;
   size?: 'sm' | 'md';
   variant?: 'default' | 'ghost' | 'primary';
-  /** Leading icon inside the button, e.g. the provider's logomark. */
   icon?: ReactNode;
-  /** Layout classes forwarded to the connect button. */
   className?: string;
-  /** Called after the provider confirmed the authorization. */
   onCompleted?: () => void;
 }
 
-/**
- * One button driving the full connect or reconnect flow for a provider.
- * Owns its mutation: mint session → headless auth → wait for activation.
- */
 export function ProviderConnectControl({
   provider,
   reconnectConnectionId,
   label,
+  buttonLabel,
   size = 'sm',
   variant = 'default',
   icon,
@@ -131,9 +124,10 @@ export function ProviderConnectControl({
         icon={icon}
         className={className}
         disabled={pending}
+        aria-label={buttonLabel && !pending ? label : undefined}
         onClick={() => (meta.authKind === 'apiKey' ? setCollectingApiKey(true) : void run())}
       >
-        {pending ? 'Connecting…' : label}
+        {pending ? 'Connecting…' : (buttonLabel ?? label)}
       </Button>
       {collectingApiKey && (
         <ApiKeyDialog
@@ -145,44 +139,5 @@ export function ProviderConnectControl({
         />
       )}
     </>
-  );
-}
-
-export interface ProviderConnectionsListProps {
-  provider: PlatformConnectProviderId;
-  connections: PlatformProviderConnection[];
-}
-
-/**
- * Per-connection rows for organizations with multiple installed accounts.
- * Healthy connections show a quiet reconnect affordance; connections the
- * provider rejected surface it prominently.
- */
-export function ProviderConnectionsList({ provider, connections }: ProviderConnectionsListProps) {
-  if (connections.length === 0) return null;
-  return (
-    <ul className="flex flex-col">
-      {connections.map(connection => (
-        <li key={connection.id} className="flex items-center justify-between gap-2 px-4 py-2">
-          <span className="flex min-w-0 items-center gap-2">
-            <Txt as="span" variant="caption" className="truncate">
-              {connectionName(connection)}
-            </Txt>
-            {connection.status === 'needs_reauth' && (
-              <Txt as="span" variant="meta" className="text-destructive-foreground">
-                Needs reauthorization
-              </Txt>
-            )}
-          </span>
-          <ProviderConnectControl
-            provider={provider}
-            reconnectConnectionId={connection.id}
-            label="Reconnect"
-            size="sm"
-            variant={connection.status === 'needs_reauth' ? 'default' : 'ghost'}
-          />
-        </li>
-      ))}
-    </ul>
   );
 }

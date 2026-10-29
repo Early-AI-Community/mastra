@@ -5,7 +5,7 @@ import { PUBSUB_SYMBOL } from '../../../../workflows/constants';
 import { createStep } from '../../../../workflows/workflow';
 import { MessageList } from '../../../message-list';
 import { DurableAgentDefaults, DurableStepIds } from '../../constants';
-import { globalRunRegistry } from '../../run-registry';
+import { getRunRegistryEntry, globalRunRegistry } from '../../run-registry';
 import { emitChunkEvent } from '../../stream-adapter';
 import { readMessageListState, storeMessageListState } from '../shared/message-list-state';
 
@@ -34,6 +34,7 @@ export function createDurableIsTaskCompleteStep(defaultMaxSteps: number = Durabl
       const { inputData, mastra, getInitData } = params;
       const state = inputData as {
         runId: string;
+        messageId?: string;
         iterationCount: number;
         /** Present only on runs that thread the transcript through step payloads. */
         messageListState?: any;
@@ -55,7 +56,7 @@ export function createDurableIsTaskCompleteStep(defaultMaxSteps: number = Durabl
         requestContextEntries?: Record<string, unknown>;
       };
 
-      const registryEntry = globalRunRegistry.get(state.runId);
+      const registryEntry = getRunRegistryEntry(state.runId, mastra);
       // No scorers → nothing to grade.
       if (!registryEntry?.isTaskComplete?.scorers?.length) return state;
 
@@ -119,6 +120,12 @@ export function createDurableIsTaskCompleteStep(defaultMaxSteps: number = Durabl
           ...nextState.lastStepResult,
           isContinued: !outcome.complete,
         };
+      }
+      // The retry turn needs its own response message (the non-durable loop
+      // switches to a fresh id too). Reusing the graded turn's id folds the
+      // retry into that earlier message, ahead of the feedback.
+      if (!outcome.complete && nextState.messageId) {
+        nextState.messageId = list().rotateResponseMessageId(nextState.messageId);
       }
       Object.assign(nextState, await storeMessageListState(params, list().serialize()));
       return nextState;

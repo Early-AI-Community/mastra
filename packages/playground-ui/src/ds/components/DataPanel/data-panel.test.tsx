@@ -27,6 +27,16 @@ describe('DataPanel', () => {
     expect(document.querySelector(POPUP)?.getAttribute('data-swipe-direction')).toBe('right');
   });
 
+  it('keeps the popup rounding on the drawer card', () => {
+    render(
+      <DataPanel open title="Span details">
+        <DataPanel.Content>Panel body</DataPanel.Content>
+      </DataPanel>,
+    );
+
+    expect(document.querySelector(`${POPUP} section`)?.className).toContain('rounded-xl');
+  });
+
   describe('when a size is given', () => {
     it('uses the viewport-relative width and ignores depth', () => {
       render(
@@ -88,7 +98,7 @@ describe('DataPanel', () => {
       </TooltipProvider>,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Close Panel' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close panel' }));
     expect(onClose).toHaveBeenCalledTimes(1);
 
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });
@@ -274,7 +284,7 @@ describe('DataPanel', () => {
     it('renders the close button before the heading', () => {
       renderHeader();
       const heading = screen.getByRole('heading', { name: 'Trace' });
-      const close = screen.getByRole('button', { name: 'Close Panel' });
+      const close = screen.getByRole('button', { name: 'Close panel' });
       expect(heading.compareDocumentPosition(close) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
     });
 
@@ -302,6 +312,30 @@ describe('DataPanel', () => {
       expect(separator.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     });
 
+    it('puts a divider between every block that follows the heading', () => {
+      render(
+        <TooltipProvider>
+          <DataPanel open title="Span">
+            <DataPanel.Header>
+              <DataPanel.HeaderContent>
+                <DataPanel.Heading>Span</DataPanel.Heading>
+                <span>Run id</span>
+                <DataPanel.Metadata>
+                  <DataPanel.Meta>12:28 PM</DataPanel.Meta>
+                </DataPanel.Metadata>
+              </DataPanel.HeaderContent>
+            </DataPanel.Header>
+          </DataPanel>
+        </TooltipProvider>,
+      );
+      const content = screen.getByRole('heading', { name: 'Span' }).parentElement;
+      if (!content) throw new Error('header content not rendered');
+      const order = Array.from(content.children).map(el =>
+        el.getAttribute('aria-hidden') === 'true' ? '|' : el.textContent,
+      );
+      expect(order).toEqual(['Span', '|', 'Run id', '|', '12:28 PM']);
+    });
+
     it('does not render a separator when there is no metadata', () => {
       render(
         <TooltipProvider>
@@ -315,6 +349,103 @@ describe('DataPanel', () => {
         </TooltipProvider>,
       );
       expect(screen.queryByRole('separator')).toBeNull();
+    });
+  });
+
+  describe('when variant is inline', () => {
+    it('renders a named region in place instead of a dialog', () => {
+      const { container } = render(
+        <DataPanel variant="inline" title="Span details">
+          <DataPanel.Content>Panel body</DataPanel.Content>
+        </DataPanel>,
+      );
+
+      const region = screen.getByRole('region', { name: 'Span details' });
+      expect(region.getAttribute('data-variant')).toBe('inline');
+      expect(container.contains(region)).toBe(true);
+      expect(region.contains(screen.getByText('Panel body'))).toBe(true);
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(document.querySelector(POPUP)).toBeNull();
+    });
+
+    it('rounds the card like the app frame it sits beside', () => {
+      render(
+        <DataPanel variant="inline" title="Span details">
+          <DataPanel.Content>Panel body</DataPanel.Content>
+        </DataPanel>,
+      );
+
+      const { className } = screen.getByRole('region', { name: 'Span details' });
+      expect(className).toContain('rounded-studio-frame');
+      expect(className).not.toContain('rounded-xl');
+    });
+
+    it('does not mark the body as drawer content', () => {
+      render(
+        <DataPanel variant="inline" title="Span details">
+          <DataPanel.Content>
+            <span>Selectable body</span>
+          </DataPanel.Content>
+        </DataPanel>,
+      );
+
+      expect(screen.getByText('Selectable body').closest('[data-drawer-content]')).toBeNull();
+    });
+
+    it('applies className to the card and exposes the description', () => {
+      render(
+        <DataPanel variant="inline" title="Span details" description="Details of the selected span" className="w-96">
+          <DataPanel.Content>Panel body</DataPanel.Content>
+        </DataPanel>,
+      );
+
+      const region = screen.getByRole('region', { name: 'Span details' });
+      expect(region.className).toContain('w-96');
+      const describedBy = region.getAttribute('aria-describedby');
+      expect(describedBy && document.getElementById(describedBy)?.textContent).toBe('Details of the selected span');
+    });
+
+    it('calls the close button onClick', () => {
+      const onClose = vi.fn();
+
+      render(
+        <TooltipProvider>
+          <DataPanel variant="inline" title="Span details">
+            <DataPanel.Header>
+              <DataPanel.Heading>Span</DataPanel.Heading>
+              <DataPanel.HeaderActions>
+                <DataPanel.CloseButton icon="x" onClick={onClose} />
+              </DataPanel.HeaderActions>
+            </DataPanel.Header>
+            <DataPanel.Content>Panel body</DataPanel.Content>
+          </DataPanel>
+        </TooltipProvider>,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: 'Close panel' }));
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
+
+    it('opens a nested Select', async () => {
+      render(
+        <DataPanel variant="inline" title="Span details">
+          <DataPanel.Content>
+            <Select defaultValue="apple">
+              <SelectTrigger>
+                <SelectValue placeholder="Pick one" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="apple">Apple</SelectItem>
+                <SelectItem value="banana">Banana</SelectItem>
+              </SelectContent>
+            </Select>
+          </DataPanel.Content>
+        </DataPanel>,
+      );
+
+      fireEvent.click(screen.getByRole('combobox'));
+
+      expect(await screen.findByRole('option', { name: 'Banana' })).toBeDefined();
     });
   });
 });

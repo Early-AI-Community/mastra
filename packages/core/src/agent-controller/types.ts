@@ -485,6 +485,8 @@ export interface AvailableModel {
   provider: string;
   /** Model name without provider prefix */
   modelName: string;
+  /** ISO release date, when supplied by the model catalog. */
+  releaseDate?: string;
   /** Whether the provider has valid authentication */
   hasApiKey: boolean;
   /** Environment variable for the provider's API key */
@@ -707,9 +709,10 @@ export interface AgentControllerDisplayState {
 
   // ── Tool suspension ─────────────────────────────────────────────────
   /**
-   * Tools awaiting resume data after calling suspend(), keyed by toolCallId.
-   * Multiple tools can be parked at once (e.g. parallel `ask_user` prompts), so
-   * resuming one leaves the others intact for the UI to keep rendering.
+   * Tools awaiting resume data after calling suspend(). Controller-produced
+   * entries are keyed by `getSuspensionAddressKey(address)` so separate runs may
+   * reuse a tool-call id; legacy events without an address remain keyed by
+   * `toolCallId`. Iterate values when the address is not already known.
    */
   pendingSuspensions: Map<
     string,
@@ -719,6 +722,10 @@ export interface AgentControllerDisplayState {
       args: unknown;
       suspendPayload: unknown;
       resumeSchema?: string;
+      /** Immutable address fields are present for controller-produced suspensions. */
+      resourceId?: string;
+      threadId?: string;
+      runId?: string;
     }
   >;
 
@@ -837,9 +844,15 @@ export type AgentControllerEvent =
   | { type: 'thread_changed'; threadId: string; previousThreadId: string | null }
   | { type: 'thread_created'; thread: AgentControllerThread }
   | { type: 'thread_deleted'; threadId: string }
+  | { type: 'thread_owner_changed'; threadId: string; fromOwnerId: string | undefined; toOwnerId: string }
   | { type: 'state_changed'; state: Record<string, unknown>; changedKeys: string[] }
   | { type: 'agent_start' }
-  | { type: 'agent_end'; reason?: 'complete' | 'aborted' | 'error' | 'suspended' }
+  | {
+      type: 'agent_end';
+      reason?: 'complete' | 'aborted' | 'error' | 'suspended';
+      /** Why an aborted run stopped, when the abort said: `'thread-lease-lost'` when another run holds its thread lease. */
+      abortReason?: string;
+    }
   | { type: 'message_start'; message: MastraDBMessage }
   | {
       type: 'message_update';
@@ -860,8 +873,17 @@ export type AgentControllerEvent =
           args: unknown;
           suspendPayload: unknown;
           resumeSchema?: string;
+          resourceId?: string;
+          runId?: string;
         }
-      | { type: 'tool_suspension_cancelled'; toolCallId: string; toolName: string; reason: string }
+      | {
+          type: 'tool_suspension_cancelled';
+          toolCallId: string;
+          toolName: string;
+          reason: string;
+          resourceId?: string;
+          runId?: string;
+        }
       | { type: 'tool_update'; toolCallId: string; partialResult: unknown }
       | {
           type: 'tool_end';
@@ -1093,7 +1115,7 @@ export interface AgentControllerRequestState<TState = unknown> {
 export interface AgentControllerRequestSession<TState = unknown> {
   /** Stable session identifier (mirrors SessionRecord.id in storage). */
   id: string;
-  /** Stable session owner (mirrors SessionRecord.ownerId in storage). */
+  /** Stable identity of the process-local session host. Use `threadOwnerId` for thread ownership and billing. */
   ownerId: string;
   /** Currently-selected mode ID */
   modeId: string;
@@ -1144,11 +1166,14 @@ export interface AgentControllerRequestContext<TState = unknown> {
   /** Thread ID captured for this request. */
   threadId: string | null;
 
-  /** Current resource ID */
+  /** Thread owner captured once when this run starts. */
+  threadOwnerId?: string;
+
+  /** Current resource ID: whose threads and memory this session uses. Several sessions may share it. */
   resourceId: string;
 
-  /** Optional isolation scope used to identify this session within its resource. */
-  scope?: string;
+  /** ID of the session handling this request. Look the session up with `AgentController.getSession(sessionId)`. */
+  sessionId: string;
 
   /**
    * Snapshot of the relevant session-owned values for this request.

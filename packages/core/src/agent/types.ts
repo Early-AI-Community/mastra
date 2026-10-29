@@ -58,6 +58,7 @@ import type { MastraModelOutput } from '../stream/base/output';
 import type {
   AgentChunkType,
   ThreadHistoryChunk,
+  ThreadRunStatusChunk,
   CustomChunkWriter,
   MastraOnFinishCallbackArgs,
   ModelManagerModelConfig,
@@ -211,6 +212,11 @@ export type SendAgentSignalOptions<OUTPUT = unknown> =
       threadId?: string;
       ifActive?: { behavior?: AgentSignalActiveBehavior; attributes?: AgentSignalAttributes };
       ifIdle?: never;
+      /**
+       * Validated, but does not change the scopes of the run receiving the signal:
+       * a run's scopes are fixed when it starts.
+       */
+      scopes?: string[];
     }
   | {
       runId?: string;
@@ -218,6 +224,11 @@ export type SendAgentSignalOptions<OUTPUT = unknown> =
       threadId: string;
       ifActive?: { behavior?: AgentSignalActiveBehavior; attributes?: AgentSignalAttributes };
       ifIdle?: AgentSignalIfIdleOptions<OUTPUT>;
+      /**
+       * Scopes for a run this signal starts, unioned with `ifIdle.streamOptions.scopes`.
+       * `resource:`/`thread:` scopes must equal `resourceId`/`threadId`.
+       */
+      scopes?: string[];
     };
 
 /**
@@ -288,6 +299,10 @@ export type QueueAgentMessageOptions<OUTPUT = unknown> = SendAgentSignalOptions<
 };
 
 export type QueueAgentMessageResult<OUTPUT = unknown> = SendAgentSignalResult<OUTPUT>;
+
+export type QueueAgentSignalOptions<OUTPUT = unknown> = QueueAgentMessageOptions<OUTPUT>;
+
+export type QueueAgentSignalResult<OUTPUT = unknown> = SendAgentSignalResult<OUTPUT>;
 
 export interface SubscribeAgentThreadEventsOptions {
   resourceId: string;
@@ -410,13 +425,23 @@ export interface AgentSubscribeToThreadOptions extends AgentThreadIdentityOption
    * chunks are always emitted.
    */
   withInitialHistory?: boolean | { perPage?: number };
+  /** Emit ordered thread-run-status chunks, including retained outcomes. Defaults to false. */
+  withRunStatus?: boolean;
   /** Request context used to resolve the agent's memory when loading initial history. */
   requestContext?: RequestContext;
 }
 
-export interface AgentThreadSubscription<OUTPUT = unknown, WITH_HISTORY extends boolean = false> {
+export interface AgentThreadSubscription<
+  OUTPUT = unknown,
+  WITH_HISTORY extends boolean = false,
+  WITH_RUN_STATUS extends boolean = false,
+> {
   /** With `withInitialHistory`, the first chunk is a `thread-history` chunk. */
-  stream: AsyncIterable<AgentChunkType<OUTPUT> | (WITH_HISTORY extends true ? ThreadHistoryChunk : never)>;
+  stream: AsyncIterable<
+    | AgentChunkType<OUTPUT>
+    | (WITH_RUN_STATUS extends true ? ThreadRunStatusChunk : never)
+    | (WITH_HISTORY extends true ? ThreadHistoryChunk : never)
+  >;
   activeRunId: () => string | null;
   /** @internal */
   __getCurrentRunRequestContext?: () => RequestContext | undefined;
@@ -819,6 +844,12 @@ interface AgentConfigBase<
    * Memory module used for storing and retrieving stateful context.
    */
   memory?: DynamicArgument<MastraMemory, TRequestContext>;
+  /**
+   * Scopes every run of this agent acts with, as `<type>:<value>` addresses such as `org:acme`.
+   * Unioned with per-call `scopes` and the reserved `mastra__scopes` request-context key.
+   * A resolver function runs once per call with the request context.
+   */
+  scopes?: DynamicArgument<string[], TRequestContext>;
   /**
    * Skills that guide agent behavior — reusable instructions the model loads on demand.
    *
@@ -1322,7 +1353,7 @@ export interface DurableAgentLike {
    */
   __subscribeToRunStream?(
     runId: string,
-    options: { offset?: number },
+    options: { offset?: number; onComplete?: () => void },
     onEvent: (event: AgentStreamEvent) => void,
   ): Promise<() => Promise<void>>;
   /**

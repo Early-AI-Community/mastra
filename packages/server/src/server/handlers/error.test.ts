@@ -123,6 +123,36 @@ describe('handleError', () => {
     });
   });
 
+  describe('AGENT_RESUME_ALREADY_CLAIMED', () => {
+    it('maps a losing concurrent approval or resume to 409', () => {
+      const err = Object.assign(new Error('already being resumed'), { id: 'AGENT_RESUME_ALREADY_CLAIMED' });
+      let caught: HTTPException | undefined;
+      try {
+        handleError(err, 'default');
+      } catch (e) {
+        caught = e as HTTPException;
+      }
+      expect(caught).toBeInstanceOf(HTTPException);
+      expect(caught!.status).toBe(409);
+      expect(caught!.message).toBe('already being resumed');
+    });
+  });
+
+  describe.each(['AGENT_RESUME_RUN_NOT_SUSPENDED', 'WORKFLOW_RUN_NOT_SUSPENDED'])('%s', id => {
+    it('maps resuming a run that is not waiting to be resumed to 409', () => {
+      const err = Object.assign(new Error('not suspended'), { id });
+      let caught: HTTPException | undefined;
+      try {
+        handleError(err, 'default');
+      } catch (e) {
+        caught = e as HTTPException;
+      }
+      expect(caught).toBeInstanceOf(HTTPException);
+      expect(caught!.status).toBe(409);
+      expect(caught!.message).toBe('not suspended');
+    });
+  });
+
   describe('WORKFLOW_RESUME_ALREADY_CLAIMED', () => {
     it('maps a losing concurrent resume to 409', () => {
       const err = Object.assign(new Error('already resumed'), { id: 'WORKFLOW_RESUME_ALREADY_CLAIMED' });
@@ -149,6 +179,21 @@ describe('handleError', () => {
     });
   });
 
+  describe('time travel conflicts', () => {
+    it.each(['WORKFLOW_TIME_TRAVEL_ALREADY_CLAIMED', 'WORKFLOW_TIME_TRAVEL_RUN_RUNNING'])('maps %s to 409', id => {
+      const err = Object.assign(new Error('already claimed'), { id });
+      let caught: HTTPException | undefined;
+      try {
+        handleError(err, 'default');
+      } catch (e) {
+        caught = e as HTTPException;
+      }
+      expect(caught).toBeInstanceOf(HTTPException);
+      expect(caught!.status).toBe(409);
+      expect(caught!.message).toBe('already claimed');
+    });
+  });
+
   describe('durable agent run conflicts', () => {
     it.each([
       'DURABLE_AGENT_RUN_ACTIVE',
@@ -167,6 +212,30 @@ describe('handleError', () => {
       expect(caught).toBeInstanceOf(HTTPException);
       expect(caught!.status).toBe(409);
       expect(caught!.message).toBe('run is busy');
+    });
+
+    it.each([
+      ['DURABLE_AGENT_RECOVER_CHECKPOINT_NOT_AVAILABLE', 'pending', 500],
+      ['DURABLE_AGENT_RECOVER_RUN_NOT_ACTIVE', 'paused', 409],
+    ])('returns a numeric HTTP failure for %s', async (id, snapshotStatus, status) => {
+      const err = new MastraError({
+        id,
+        domain: ErrorDomain.AGENT,
+        category: ErrorCategory.USER,
+        text: 'No restartable checkpoint is available',
+        details: { agentName: 'agent', runId: 'run', snapshotStatus },
+      });
+      let caught: HTTPException | undefined;
+      try {
+        handleError(err, 'Recovery failed');
+      } catch (error) {
+        caught = error as HTTPException;
+      }
+      expect(caught).toBeInstanceOf(HTTPException);
+      const response = caught!.getResponse();
+      expect(response.status).toBe(status);
+      expect(response.ok).toBe(false);
+      expect(await response.text()).toBe(err.message);
     });
 
     it('does not treat a superseded execution as a request conflict', () => {

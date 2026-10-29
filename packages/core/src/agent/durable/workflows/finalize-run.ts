@@ -15,11 +15,14 @@ import type { ChunkType } from '../../../stream/types';
 import type { Agent } from '../../agent';
 import { convertMessages, coreContentToString, MessageList } from '../../message-list';
 import type { SerializedMessageListState } from '../../message-list/state';
+import { undoSavedResponseMessages } from '../../save-queue/undo-saved-response-messages';
+import { restoreRunAgentScopes } from '../../scopes';
 import { TripWire } from '../../trip-wire';
 import type { StructuredOutputOptions } from '../../types';
+import { isDurableAgentLike } from '../../types';
 import { assertExecutionOwned, isExecutionFenceError } from '../execution-fence';
 import { authorizeDurableMemory, getDurableMemoryAuthorizationChecks } from '../memory-fga';
-import { globalRunRegistry } from '../run-registry';
+import { getRunRegistryEntry } from '../run-registry';
 import type { DurableAgenticWorkflowInput, RunRegistryEntry } from '../types';
 import { resolveRuntimeDependencies } from '../utils/resolve-runtime';
 
@@ -41,6 +44,12 @@ export interface DurableFinishSideEffectsResult {
   messageListState: SerializedMessageListState;
   outputText: string;
   titleGeneration?: Promise<void>;
+  /**
+   * Set when this stream() run should emit a `data-thread-title` chunk (`generateTitle.emitEvent`).
+   * Resolves with the saved title, or undefined when none was generated. Callers await it
+   * before FINISH so the chunk lands first, matching the in-process loop.
+   */
+  titleForStream?: Promise<string | undefined>;
   /** Chunks from the `structuredOutput.model` structuring pass, to publish before FINISH. */
   structuredOutputChunks?: ChunkType[];
   /** Set when an output processor aborted in processOutputResult; nothing was persisted. */
@@ -60,6 +69,7 @@ function restoreRequestContext(
 
   const restored = new RequestContext<unknown>(fallback?.entries());
   for (const [key, value] of Object.entries(entries)) restored.set(key, value);
+  restoreRunAgentScopes(restored);
   return restored;
 }
 
@@ -104,7 +114,7 @@ export async function runDurableFinishSideEffects({
   // A connect() worker has a separate process-local registry. Rebuild the
   // agent's runtime dependencies when the terminal step cannot see the
   // processor pipeline or the memory save queue prepared by stream().
-  let registryEntry = globalRunRegistry.get(runId);
+  let registryEntry = getRunRegistryEntry(runId, mastra as Mastra | undefined);
   // resolveRuntimeDependencies only writes its rebuild back into the registry when it
   // rehydrated from Mastra, so an already-hydrated entry that was seeded without a save
   // queue would still be missing one afterwards. Keep what it returns and prefer that.
@@ -124,7 +134,7 @@ export async function runDurableFinishSideEffects({
       });
       rebuiltSaveQueueManager = resolved.saveQueueManager;
       rebuiltMemory = resolved.memory;
-      registryEntry = globalRunRegistry.get(runId);
+      registryEntry = getRunRegistryEntry(runId, mastra as Mastra | undefined);
     } catch (error) {
       effectiveLogger.error('[DurableAgent] Failed to rebuild finish-time dependencies', {
         agentId: initData.agentId,
@@ -229,8 +239,7 @@ export async function runDurableFinishSideEffects({
   // Output processors persist messages too (MessageHistory saves the response
   // in processOutputResult), so a superseded execution must stop here, before
   // either memory write path, and never reach the finish event (#23734). This
-  // check sits outside the processor try/catch, which swallows errors. It uses
-  // the live `requestContext`: the snapshot entries never carry the
+  // check uses the live `requestContext`: the snapshot entries never carry the
   // execution id.
   const assertOwned = () => assertExecutionOwned({ runId, agentId: initData.agentId, requestContext, mastra });
   await assertOwned();
@@ -239,10 +248,11 @@ export async function runDurableFinishSideEffects({
   // returned message arrays back onto it, including removals and replacements.
   if (registryEntry?.outputProcessors?.length) {
     try {
-      let agent: AnyAgent | undefined;
-      if (mastra) {
+      let agent: AnyAgent | undefined = registryEntry.agent;
+      if (!agent && mastra) {
         try {
-          agent = mastra.getAgentById(initData.agentId);
+          const registered = mastra.getAgentById(initData.agentId);
+          agent = isDurableAgentLike(registered) && registered.agent !== registered ? registered.agent : registered;
         } catch {
           agent = undefined;
         }
@@ -267,7 +277,17 @@ export async function runDurableFinishSideEffects({
       );
     } catch (error) {
       if (error instanceof TripWire) {
-        // Match Agent: a tripwire rejects the answer, so skip persistence and title generation.
+        // Match Agent: a tripwire rejects the answer, so skip persistence and title generation,
+        // and remove any response messages this run already saved.
+        await undoSavedResponseMessages({
+          memory: registryEntry?.memory ?? rebuiltMemory,
+          threadId: durableState?.threadId,
+          memoryConfig: durableState?.memoryConfig,
+          messageList,
+          saveQueueManager: registryEntry?.saveQueueManager ?? rebuiltSaveQueueManager,
+          logger: effectiveLogger,
+          runId,
+        });
         return {
           messageListState: messageList.serialize(),
           outputText: resolveOutputText(messageList),
@@ -280,6 +300,9 @@ export async function runDurableFinishSideEffects({
         };
       }
       effectiveLogger.warn('[DurableAgent] Error running output processors', { runId, error });
+      // Ordinary history can retry through the strict queue flush below. OM owns
+      // its final write and skips that flush, so its failure must propagate here.
+      if (durableState?.observationalMemory) throw error;
     }
   }
 
@@ -325,6 +348,7 @@ export async function runDurableFinishSideEffects({
 
       await saveQueueManager.flushMessages(messageList, durableState.threadId, durableState.memoryConfig, {
         beforePersist: assertOwned,
+        throwOnError: true,
       });
     } catch (error) {
       if (isExecutionFenceError(error)) throw error;
@@ -333,10 +357,12 @@ export async function runDurableFinishSideEffects({
         threadId: durableState.threadId,
         error,
       });
+      throw error;
     }
   }
 
   let titleGeneration: Promise<void> | undefined;
+  let titleForStream: Promise<string | undefined> | undefined;
 
   // Same exclusions as the persistence block above: an observational-memory run writes no
   // messages here, and titling it would create a thread row holding a title and nothing else.
@@ -358,25 +384,40 @@ export async function runDurableFinishSideEffects({
     const generateThreadTitle = registryEntry?.generateThreadTitle;
     await authorizeMemory!(MastraFGAPermissions.MEMORY_READ);
     await authorizeMemory!(MastraFGAPermissions.MEMORY_WRITE);
-    titleGeneration = (async () => {
+    const savedTitle = (async (): Promise<string | undefined> => {
       if (generateThreadTitle) {
-        await generateThreadTitle(titleArgs);
+        return generateThreadTitle(titleArgs);
       } else if (mastra) {
         const agent = mastra.getAgentById(initData.agentId);
         const titleMemory = memory ?? (await agent.getMemory({ requestContext: effectiveRequestContext }));
         if (titleMemory) {
-          await generateDurableThreadTitle({ agent, memory: titleMemory, ...titleArgs });
+          return generateDurableThreadTitle({ agent, memory: titleMemory, ...titleArgs });
         }
       }
+      return undefined;
     })().catch(error => {
       effectiveLogger.warn('[DurableAgent] Error generating thread title', { runId, error });
+      return undefined;
     });
+
+    if (registryEntry?.streamThreadTitle) titleForStream = savedTitle;
+
+    // The user callback runs after the title is saved but never holds FINISH.
+    const onTitleGenerated = registryEntry?.onTitleGenerated;
+    titleGeneration = savedTitle
+      .then(async title => {
+        if (title && onTitleGenerated) await onTitleGenerated(title);
+      })
+      .catch(error => {
+        effectiveLogger.error('[DurableAgent] Error in onTitleGenerated callback', { runId, error });
+      });
   }
 
   return {
     messageListState: messageList.serialize(),
     outputText,
     titleGeneration,
+    titleForStream,
     structuredOutputChunks,
   };
 }
@@ -490,20 +531,20 @@ export async function generateDurableThreadTitle({
   messageListState,
   requestContext,
   tracingContext,
-}: GenerateThreadTitleArgs & { agent: AnyAgent; memory: MastraMemory }): Promise<void> {
+}: GenerateThreadTitleArgs & { agent: AnyAgent; memory: MastraMemory }): Promise<string | undefined> {
   const thread = await memory.getThreadById({ threadId });
   const mergedConfig = memory.getMergedThreadConfig(memoryConfig);
   const { shouldGenerate, model, instructions, minMessages } = agent.resolveTitleGenerationConfig(
     mergedConfig.generateTitle,
   );
-  if (!shouldGenerate || thread?.title) return;
+  if (!shouldGenerate || thread?.title) return undefined;
 
   const titleMessageList = new MessageList().deserialize(messageListState);
   const uiMessages = agent.filterUiMessagesByThread(titleMessageList, threadId, titleMessageList.get.all.ui());
-  if (uiMessages.length < (minMessages ?? 1)) return;
+  if (uiMessages.length < (minMessages ?? 1)) return undefined;
 
   const userMessage = agent.getMostRecentUserMessage(uiMessages);
-  if (!userMessage) return;
+  if (!userMessage) return undefined;
 
   const title = await agent.genTitle(
     userMessage,
@@ -513,7 +554,7 @@ export async function generateDurableThreadTitle({
     instructions,
     uiMessages,
   );
-  if (!title) return;
+  if (!title) return undefined;
 
   // genTitle is a model round trip, so another writer may have created the thread in the
   // meantime. Re-read before falling back to createThread, which upserts the whole row and
@@ -535,4 +576,5 @@ export async function generateDurableThreadTitle({
       title,
     });
   }
+  return title;
 }

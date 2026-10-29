@@ -13,7 +13,8 @@ import { DefaultObservabilityInstance } from '@mastra/observability';
 import { context, isSpanContextValid, trace } from '@opentelemetry/api';
 import { logs as otelLogs, SeverityNumber } from '@opentelemetry/api-logs';
 import { InMemoryLogRecordExporter, LoggerProvider, SimpleLogRecordProcessor } from '@opentelemetry/sdk-logs';
-import { node, tracing } from '@opentelemetry/sdk-node';
+import { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { NodeTracerProvider } from '@opentelemetry/sdk-trace-node';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { OtelBridge } from './bridge.js';
 
@@ -26,12 +27,12 @@ describe('OtelBridge', () => {
   // to produce valid span contexts. Without this, the OTEL API falls back to a
   // no-op tracer whose spans carry all-zero IDs (see issue #15589 regression
   // tests below).
-  let tracerProvider: tracing.BasicTracerProvider;
+  let tracerProvider: BasicTracerProvider;
   let loggerProvider: LoggerProvider;
   let logExporter: InMemoryLogRecordExporter;
 
   beforeAll(() => {
-    tracerProvider = new tracing.BasicTracerProvider();
+    tracerProvider = new BasicTracerProvider();
     trace.setGlobalTracerProvider(tracerProvider);
 
     logExporter = new InMemoryLogRecordExporter();
@@ -102,10 +103,10 @@ describe('OtelBridge', () => {
       // context.with() is a no-op there. Register a NodeTracerProvider for
       // its AsyncLocalStorage context manager; the global tracer provider
       // set in beforeAll stays in place (first registration wins).
-      let nodeProvider: InstanceType<typeof node.NodeTracerProvider>;
+      let nodeProvider: NodeTracerProvider;
 
       beforeAll(() => {
-        nodeProvider = new node.NodeTracerProvider();
+        nodeProvider = new NodeTracerProvider();
         nodeProvider.register();
       });
 
@@ -667,6 +668,74 @@ describe('OtelBridge', () => {
     });
   });
 
+  describe('flush with global providers', () => {
+    it('flushes the tracer provider registered globally through the API proxy', async () => {
+      // trace.getTracerProvider() returns the API's ProxyTracerProvider, which
+      // has no forceFlush of its own; the bridge must reach the delegate.
+      const forceFlush = vi.spyOn(tracerProvider, 'forceFlush');
+      try {
+        const bridge = new OtelBridge();
+        await bridge.flush();
+
+        expect(forceFlush).toHaveBeenCalledTimes(1);
+        await bridge.shutdown();
+      } finally {
+        forceFlush.mockRestore();
+      }
+    });
+
+    it('flushes a logger provider registered after the bridge was constructed', async () => {
+      otelLogs.disable();
+      const lateLoggerProvider = new LoggerProvider({
+        processors: [new SimpleLogRecordProcessor({ exporter: new InMemoryLogRecordExporter() })],
+      });
+      const forceFlush = vi.spyOn(lateLoggerProvider, 'forceFlush');
+      try {
+        const bridge = new OtelBridge();
+        otelLogs.setGlobalLoggerProvider(lateLoggerProvider);
+
+        await bridge.flush();
+
+        expect(forceFlush).toHaveBeenCalledTimes(1);
+        await bridge.shutdown();
+      } finally {
+        forceFlush.mockRestore();
+        await lateLoggerProvider.shutdown();
+        otelLogs.disable();
+        otelLogs.setGlobalLoggerProvider(loggerProvider);
+      }
+    });
+
+    it('ends leftover spans before flushing on shutdown', async () => {
+      const calls: string[] = [];
+      const customProvider = new BasicTracerProvider({
+        spanProcessors: [
+          {
+            onStart: () => {},
+            onEnd: () => calls.push('end'),
+            forceFlush: async () => {
+              calls.push('flush');
+            },
+            shutdown: async () => {},
+          },
+        ],
+      });
+      const bridge = new OtelBridge({ tracerProvider: customProvider });
+
+      const result = bridge.createSpan({
+        type: SpanType.AGENT_RUN,
+        name: 'left-open',
+        attributes: { agentId: 'test' },
+      } as CreateSpanOptions<SpanType.AGENT_RUN>);
+      expect(result).toBeDefined();
+
+      await bridge.shutdown();
+
+      expect(calls).toEqual(['end', 'flush']);
+      await customProvider.shutdown();
+    });
+  });
+
   describe('bridge name', () => {
     it('should have name "otel"', () => {
       const bridge = new OtelBridge();
@@ -872,7 +941,7 @@ describe('OtelBridge', () => {
     it('should use a custom tracerProvider to create spans without touching the global', async () => {
       trace.disable();
       try {
-        const customProvider = new tracing.BasicTracerProvider();
+        const customProvider = new BasicTracerProvider();
         const bridge = new OtelBridge({ tracerProvider: customProvider });
 
         const result = bridge.createSpan({
@@ -928,7 +997,7 @@ describe('OtelBridge', () => {
     });
 
     it('should flush the custom provider, not the global', async () => {
-      const customProvider = new tracing.BasicTracerProvider();
+      const customProvider = new BasicTracerProvider();
       let flushed = false;
       const originalFlush = customProvider.forceFlush.bind(customProvider);
       customProvider.forceFlush = async () => {
@@ -949,7 +1018,7 @@ describe('OtelBridge', () => {
       trace.disable();
       otelLogs.disable();
       try {
-        const customTracerProvider = new tracing.BasicTracerProvider();
+        const customTracerProvider = new BasicTracerProvider();
         const customLogExporter = new InMemoryLogRecordExporter();
         const customLoggerProvider = new LoggerProvider({
           processors: [new SimpleLogRecordProcessor({ exporter: customLogExporter })],
@@ -994,9 +1063,9 @@ describe('OtelBridge', () => {
     it('should export span attributes correctly through custom provider', async () => {
       trace.disable();
       try {
-        const spanExporter = new tracing.InMemorySpanExporter();
-        const customProvider = new tracing.BasicTracerProvider({
-          spanProcessors: [new tracing.SimpleSpanProcessor(spanExporter)],
+        const spanExporter = new InMemorySpanExporter();
+        const customProvider = new BasicTracerProvider({
+          spanProcessors: [new SimpleSpanProcessor(spanExporter)],
         });
 
         const bridge = new OtelBridge({ tracerProvider: customProvider });
